@@ -56,6 +56,124 @@ type FilePart = {
   mime: string
 }
 
+type TextPart = {
+  type: "text"
+  text: string
+}
+
+type PromptPart = FilePart | TextPart
+
+/**
+ * Parse message text and extract image URLs to create vision-compatible parts.
+ * This enables VL (Visual Language) support by converting image URLs in the text
+ * into file parts that the LLM can process as vision input.
+ */
+function parseMessageWithImages(message: string): PromptPart[] {
+  if (!message) return [{ type: "text", text: "" }]
+
+  // Common image extensions
+  const imageExtensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]
+
+  // Regex to match URLs (http/https)
+  const urlRegex = /(https?:\/\/[^\s]+)/gi
+
+  const parts: PromptPart[] = []
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  // Find all URLs in the message
+  while ((match = urlRegex.exec(message)) !== null) {
+    const url = match[0]
+    const matchStart = match.index
+    const matchEnd = matchStart + url.length
+
+    // Add text before the URL
+    if (matchStart > lastIndex) {
+      const textBefore = message.slice(lastIndex, matchStart).trim()
+      if (textBefore) {
+        if (parts.length > 0 && parts[parts.length - 1].type === "text") {
+          // Append to existing text part
+          const lastPart = parts[parts.length - 1] as TextPart
+          lastPart.text += " " + textBefore
+        } else {
+          parts.push({ type: "text", text: textBefore })
+        }
+      }
+    }
+
+    // Check if URL is an image
+    const lowerUrl = url.toLowerCase()
+    const isImage = imageExtensions.some((ext) => lowerUrl.endsWith(ext) || lowerUrl.includes(ext + "?"))
+
+    if (isImage) {
+      // Extract filename from URL
+      const urlObj = URL.parse(url)
+      let filename = "image"
+      if (urlObj) {
+        const pathname = urlObj.pathname
+        const lastSlash = pathname.lastIndexOf("/")
+        if (lastSlash !== -1 && lastSlash < pathname.length - 1) {
+          filename = pathname.slice(lastSlash + 1)
+          // Remove query parameters from filename
+          const queryIndex = filename.indexOf("?")
+          if (queryIndex !== -1) {
+            filename = filename.slice(0, queryIndex)
+          }
+        }
+      }
+
+      // Determine MIME type from extension
+      let mime = "image/png" // default
+      if (lowerUrl.endsWith(".jpg") || lowerUrl.endsWith(".jpeg")) {
+        mime = "image/jpeg"
+      } else if (lowerUrl.endsWith(".gif")) {
+        mime = "image/gif"
+      } else if (lowerUrl.endsWith(".webp")) {
+        mime = "image/webp"
+      } else if (lowerUrl.endsWith(".svg")) {
+        mime = "image/svg+xml"
+      }
+
+      parts.push({
+        type: "file",
+        url: url,
+        filename: filename,
+        mime: mime,
+      })
+    } else {
+      // Not an image, add as text
+      if (parts.length > 0 && parts[parts.length - 1].type === "text") {
+        const lastPart = parts[parts.length - 1] as TextPart
+        lastPart.text += " " + url
+      } else {
+        parts.push({ type: "text", text: url })
+      }
+    }
+
+    lastIndex = matchEnd
+  }
+
+  // Add remaining text after the last URL
+  if (lastIndex < message.length) {
+    const textAfter = message.slice(lastIndex).trim()
+    if (textAfter) {
+      if (parts.length > 0 && parts[parts.length - 1].type === "text") {
+        const lastPart = parts[parts.length - 1] as TextPart
+        lastPart.text += " " + textAfter
+      } else {
+        parts.push({ type: "text", text: textAfter })
+      }
+    }
+  }
+
+  // If no URLs found or no parts created, return the original message as text
+  if (parts.length === 0) {
+    return [{ type: "text", text: message }]
+  }
+
+  return parts
+}
+
 const ATTACH_FILE_MAX_BYTES = 10 * 1024 * 1024
 
 type Inline = {
@@ -861,12 +979,14 @@ export const RunCommand = effectCmd({
           }
 
           const model = pick(args.model)
+          // Parse message to extract image URLs and convert them to file parts for VL support
+          const messageParts = parseMessageWithImages(message)
           const result = await client.session.prompt({
             sessionID,
             agent,
             model,
             variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
+            parts: [...files, ...messageParts],
           })
           if (result.error) {
             if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
